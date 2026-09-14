@@ -9,14 +9,12 @@ const path = require("path");
 const { encryptBuffer, decryptBuffer } = require("./encryption");
 const { uploadToIPFS, fetchFromIPFS } = require("./ipfs");
 const { getContract, getProvider, getServerSigner, recordIdFromString } = require("./contract");
+const { keyManager } = require("./keyManager");
 
 const app = express();
 app.use(cors({ exposedHeaders: ["Content-Disposition", "X-Original-Filename", "X-Original-Mimetype"] }));
 app.use(express.json());
 const upload = multer({ storage: multer.memoryStorage() });
-
-// In-memory key vault for prototype (per user architecture specification)
-const keyVault = new Map(); // recordId => { key, iv, authTag, filename, mimeType }
 
 app.get("/config", (req, res) => {
   res.json({
@@ -26,10 +24,21 @@ app.get("/config", (req, res) => {
   });
 });
 
+// List records (optionally filtered by owner) for dashboard & "My Records"
+app.get("/records", (req, res) => {
+  try {
+    const { owner } = req.query;
+    const records = keyManager.listRecords(owner);
+    res.json({ records });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Prepares a record for client-side wallet signing:
 // 1. Encrypts file with AES-256-GCM
 // 2. Pins ciphertext to IPFS
-// 3. Stores key material in keyVault
+// 3. Initializes per-grantee key wrapping envelope in keyManager
 // 4. Returns { recordId, recordLabel, cid } so the owner's MetaMask wallet can sign contract.registerRecord() directly
 app.post("/records/prepare", upload.single("file"), async (req, res) => {
   try {
@@ -39,10 +48,18 @@ app.post("/records/prepare", upload.single("file"), async (req, res) => {
     const recordId = recordIdFromString(recordLabel);
     const filename = req.file.originalname || "record.pdf";
     const mimeType = req.file.mimetype || "application/pdf";
+    const ownerAddress = req.body.ownerAddress || null;
 
     const { ciphertext, key, iv, authTag } = encryptBuffer(req.file.buffer);
     const cid = await uploadToIPFS(ciphertext);
-    keyVault.set(recordId, { key, iv, authTag, filename, mimeType });
+
+    // Initialize key envelope with per-grantee wrapping
+    keyManager.initRecord(
+      recordId,
+      key,
+      { filename, mimeType, iv, authTag, cid, recordLabel },
+      ownerAddress
+    );
 
     res.json({ recordId, recordLabel, cid });
   } catch (err) {
@@ -62,9 +79,18 @@ app.post("/records/upload", upload.single("file"), async (req, res) => {
 
     const { ciphertext, key, iv, authTag } = encryptBuffer(req.file.buffer);
     const cid = await uploadToIPFS(ciphertext);
-    keyVault.set(recordId, { key, iv, authTag, filename, mimeType });
 
     const signer = getServerSigner();
+    const ownerAddress = req.body.ownerAddress || (await signer.getAddress());
+
+    // Initialize key envelope with per-grantee wrapping
+    keyManager.initRecord(
+      recordId,
+      key,
+      { filename, mimeType, iv, authTag, cid, recordLabel },
+      ownerAddress
+    );
+
     const contract = getContract(signer);
     const tx = await contract.registerRecord(recordId, cid);
     await tx.wait();
@@ -86,7 +112,25 @@ app.post("/records/:recordId/grant", async (req, res) => {
     const tx = await contract.grantAccess(recordId, granteeAddress, expiresAt || 0);
     await tx.wait();
 
+    // Wrap key specifically for grantee in key manager
+    keyManager.grantKeyToGrantee(recordId, granteeAddress);
+
     res.json({ status: "granted", txHash: tx.hash });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync endpoint when owner executes grantAccess directly via MetaMask wallet
+app.post("/records/:recordId/sync-grant", async (req, res) => {
+  try {
+    const { recordId } = req.params;
+    const { granteeAddress } = req.body;
+    if (!granteeAddress) return res.status(400).json({ error: "granteeAddress is required" });
+
+    keyManager.grantKeyToGrantee(recordId, granteeAddress);
+    res.json({ status: "synced", grantees: keyManager.listGranteeAddresses(recordId) });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -103,7 +147,25 @@ app.post("/records/:recordId/revoke", async (req, res) => {
     const tx = await contract.revokeAccess(recordId, granteeAddress);
     await tx.wait();
 
+    // Revoke wrapped key for grantee
+    keyManager.revokeKeyForGrantee(recordId, granteeAddress);
+
     res.json({ status: "revoked", txHash: tx.hash });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Sync endpoint when owner executes revokeAccess directly via MetaMask wallet
+app.post("/records/:recordId/sync-revoke", async (req, res) => {
+  try {
+    const { recordId } = req.params;
+    const { granteeAddress } = req.body;
+    if (!granteeAddress) return res.status(400).json({ error: "granteeAddress is required" });
+
+    keyManager.revokeKeyForGrantee(recordId, granteeAddress);
+    res.json({ status: "synced" });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
@@ -222,18 +284,31 @@ app.get("/records/:recordId/download", async (req, res) => {
       .find((e) => e && e.name === "AccessAttempted");
 
     if (!event || !event.args.granted) {
-      return res.status(403).json({ error: "Access denied", txHash: tx.hash });
+      return res.status(403).json({ error: "Access denied: Not authorized on blockchain", txHash: tx.hash });
     }
 
     const [, cid] = await contract.getRecord(recordId);
     const ciphertext = await fetchFromIPFS(cid);
 
-    const { key, iv, authTag, filename, mimeType } = keyVault.get(recordId) || {};
-    if (!key) return res.status(500).json({ error: "Decryption key unavailable server-side" });
+    const meta = keyManager.getRecordMetadata(recordId);
+    if (!meta) {
+      return res.status(500).json({ error: "Record metadata unavailable in key manager" });
+    }
 
-    const plaintext = decryptBuffer(ciphertext, key, iv, authTag);
-    const resolvedName = filename || "decrypted-record.pdf";
-    const resolvedMime = mimeType || "application/pdf";
+    // Envelope encryption: unwrap the DEK specifically for this requester
+    let unwrappedKey;
+    try {
+      unwrappedKey = keyManager.unwrapKeyForRequester(recordId, requesterAddress);
+    } catch (keyErr) {
+      return res.status(403).json({
+        error: `Decryption key envelope error: ${keyErr.message}`,
+        txHash: tx.hash
+      });
+    }
+
+    const plaintext = decryptBuffer(ciphertext, unwrappedKey, meta.iv, meta.authTag);
+    const resolvedName = meta.filename || "decrypted-record.pdf";
+    const resolvedMime = meta.mimeType || "application/pdf";
     res.set("Content-Type", resolvedMime);
     res.set("Content-Disposition", `attachment; filename="${resolvedName}"`);
     res.set("X-Original-Filename", resolvedName);
@@ -247,3 +322,5 @@ app.get("/records/:recordId/download", async (req, res) => {
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`SecureShare backend listening on port ${PORT}`));
+
+module.exports = app;

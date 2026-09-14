@@ -29,7 +29,12 @@ import {
   CheckCircle2,
   XCircle,
   HelpCircle,
-  ChevronRight
+  ChevronRight,
+  Globe,
+  Info,
+  Sparkles,
+  FolderOpen,
+  AlertTriangle,
 } from "lucide-react";
 
 const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:4000";
@@ -61,7 +66,7 @@ const DEMO_ROLES = [
 ];
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState("upload"); // upload | access | decrypt | multiparty | audit
+  const [activeTab, setActiveTab] = useState("upload"); // upload | records | access | decrypt | multiparty | audit
 
   // Configuration & Contract Info
   const [contractAddress, setContractAddress] = useState(
@@ -74,6 +79,13 @@ export default function App() {
   const [walletChainId, setWalletChainId] = useState(null);
   const [isConnectingWallet, setIsConnectingWallet] = useState(false);
   const [useServerSignerFallback, setUseServerSignerFallback] = useState(false);
+  const [dismissMetaMaskWarning, setDismissMetaMaskWarning] = useState(false);
+  const [nonceModalError, setNonceModalError] = useState(null);
+  const [showHowItWorksModal, setShowHowItWorksModal] = useState(false);
+
+  // Records List State ("My Records")
+  const [recordsList, setRecordsList] = useState([]);
+  const [isLoadingRecords, setIsLoadingRecords] = useState(false);
 
   // Upload State
   const [file, setFile] = useState(null);
@@ -132,6 +144,115 @@ export default function App() {
     setAuditLogs((prev) => [newEntry, ...prev]);
   };
 
+  // Supported Networks
+  const NETWORKS = {
+    "0x7a69": {
+      name: "Hardhat Local",
+      chainId: "0x7a69",
+      decChainId: 31337,
+      color: "#10b981",
+      rpcUrl: rpcUrl || "http://127.0.0.1:8545",
+    },
+    "0xaa36a7": {
+      name: "Sepolia Testnet",
+      chainId: "0xaa36a7",
+      decChainId: 11155111,
+      color: "#a855f7",
+      rpcUrl: "https://rpc.sepolia.org",
+      explorer: "https://sepolia.etherscan.io",
+    },
+  };
+
+  // Helper for Ethereum address validation
+  const isValidAddress = (addr) => {
+    if (!addr) return false;
+    try {
+      return ethers.isAddress(addr);
+    } catch {
+      return false;
+    }
+  };
+
+  // Human-readable MetaMask error parser
+  const parseMetaMaskError = (err) => {
+    const errCode = err?.code || err?.info?.error?.code;
+    const msg = err?.message || "";
+    const reason = err?.reason || err?.info?.error?.message || err?.shortMessage || "";
+
+    if (errCode === 4001 || msg.includes("ACTION_REJECTED") || msg.includes("user rejected")) {
+      return {
+        title: "Signature Cancelled",
+        message: "You cancelled the transaction request in MetaMask.",
+        isNonce: false,
+      };
+    }
+
+    if (
+      errCode === -32000 ||
+      msg.toLowerCase().includes("nonce") ||
+      reason.toLowerCase().includes("nonce") ||
+      msg.includes("replacement transaction underpriced")
+    ) {
+      return {
+        title: "MetaMask Nonce Desync",
+        message:
+          "Hardhat node was restarted and transaction nonces reset. Please clear your MetaMask activity cache: MetaMask -> Settings -> Advanced -> Clear activity tab data.",
+        isNonce: true,
+      };
+    }
+
+    if (msg.includes("caller is not the data owner") || reason.includes("caller is not the data owner")) {
+      return {
+        title: "Unauthorized Action",
+        message: "Only the record owner can grant or revoke access for this record.",
+        isNonce: false,
+      };
+    }
+
+    if (msg.includes("record already registered") || reason.includes("record already registered")) {
+      return {
+        title: "Duplicate Record",
+        message: "This record label or ID is already registered on the blockchain.",
+        isNonce: false,
+      };
+    }
+
+    if (msg.includes("record does not exist") || reason.includes("record does not exist")) {
+      return {
+        title: "Record Not Found",
+        message: "Record does not exist on the blockchain.",
+        isNonce: false,
+      };
+    }
+
+    if (msg.includes("insufficient funds") || reason.includes("insufficient funds")) {
+      return {
+        title: "Insufficient Gas Funds",
+        message: "Connected wallet has insufficient ETH for transaction gas fees.",
+        isNonce: false,
+      };
+    }
+
+    return {
+      title: "Transaction Error",
+      message: reason || msg || "An unexpected transaction error occurred.",
+      isNonce: false,
+    };
+  };
+
+  // Fetch records from backend
+  const fetchRecords = async () => {
+    setIsLoadingRecords(true);
+    try {
+      const { data } = await axios.get(`${API_BASE}/records`);
+      setRecordsList(data.records || []);
+    } catch (err) {
+      console.warn("Records fetch error:", err.message);
+    } finally {
+      setIsLoadingRecords(false);
+    }
+  };
+
   // Fetch contract config from backend on mount
   useEffect(() => {
     const fetchConfig = async () => {
@@ -148,6 +269,7 @@ export default function App() {
       }
     };
     fetchConfig();
+    fetchRecords();
 
     // Check if MetaMask is already connected
     if (window.ethereum) {
@@ -178,7 +300,7 @@ export default function App() {
   // Connect MetaMask
   const connectWallet = async () => {
     if (!window.ethereum) {
-      showToast("MetaMask not found. Please install MetaMask or use Server Signing.", "warning");
+      showToast("MetaMask not found. Please install the extension or enable Server Signing.", "warning");
       return;
     }
     setIsConnectingWallet(true);
@@ -190,43 +312,69 @@ export default function App() {
       const chainId = await window.ethereum.request({ method: "eth_chainId" });
       setWalletChainId(chainId);
 
-      // Check if on Hardhat (31337 / 0x7a69 or 1337 / 0x539)
-      if (chainId !== "0x7a69" && chainId !== "0x539") {
-        await switchOrAddHardhatNetwork();
+      // Check if on Hardhat (31337 / 0x7a69) or Sepolia (11155111 / 0xaa36a7)
+      if (chainId !== "0x7a69" && chainId !== "0x539" && chainId !== "0xaa36a7") {
+        await switchNetwork("0x7a69");
       }
 
       showToast(`Connected: ${address.substring(0, 6)}...${address.substring(38)}`, "success");
     } catch (err) {
-      showToast(`Wallet connection error: ${err.message}`, "error");
+      const parsed = parseMetaMaskError(err);
+      showToast(`${parsed.title}: ${parsed.message}`, "error");
     } finally {
       setIsConnectingWallet(false);
     }
   };
 
-  const switchOrAddHardhatNetwork = async () => {
-    if (!window.ethereum) return;
+  const switchNetwork = async (targetChainId) => {
+    if (!window.ethereum) {
+      showToast("MetaMask is not installed.", "warning");
+      return;
+    }
     try {
       await window.ethereum.request({
         method: "wallet_switchEthereumChain",
-        params: [{ chainId: "0x7a69" }],
+        params: [{ chainId: targetChainId }],
       });
+      setWalletChainId(targetChainId);
+      showToast(`Switched network to ${NETWORKS[targetChainId]?.name || targetChainId}`, "success");
     } catch (switchError) {
       if (switchError.code === 4902) {
         try {
-          await window.ethereum.request({
-            method: "wallet_addEthereumChain",
-            params: [
-              {
-                chainId: "0x7a69",
-                chainName: "Hardhat Localhost",
-                rpcUrls: [rpcUrl || "http://127.0.0.1:8545"],
-                nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
-              },
-            ],
-          });
+          if (targetChainId === "0x7a69") {
+            await window.ethereum.request({
+              method: "wallet_addEthereumChain",
+              params: [
+                {
+                  chainId: "0x7a69",
+                  chainName: "Hardhat Localhost",
+                  rpcUrls: [rpcUrl || "http://127.0.0.1:8545"],
+                  nativeCurrency: { name: "ETH", symbol: "ETH", decimals: 18 },
+                },
+              ],
+            });
+          } else if (targetChainId === "0xaa36a7") {
+            await window.ethereum.request({
+              method: "wallet_addEthereumChain",
+              params: [
+                {
+                  chainId: "0xaa36a7",
+                  chainName: "Ethereum Sepolia Testnet",
+                  rpcUrls: ["https://rpc.sepolia.org", "https://ethereum-sepolia-rpc.publicnode.com"],
+                  nativeCurrency: { name: "Sepolia ETH", symbol: "SEP", decimals: 18 },
+                  blockExplorerUrls: ["https://sepolia.etherscan.io"],
+                },
+              ],
+            });
+          }
+          setWalletChainId(targetChainId);
+          showToast("Network added & switched!", "success");
         } catch (addError) {
-          console.error("Failed to add Hardhat network:", addError);
+          showToast(`Failed to add network: ${addError.message}`, "error");
         }
+      } else {
+        const parsed = parseMetaMaskError(switchError);
+        showToast(`Network switch error: ${parsed.message}`, "error");
       }
     }
   };
@@ -255,7 +403,10 @@ export default function App() {
     try {
       // Step A: If MetaMask is connected and not using fallback, perform genuine client-side signing
       if (walletAddress && !useServerSignerFallback) {
-        // Prepare: Encrypt off-chain + pin to IPFS
+        // Pass owner address so backend key manager wraps DEK for owner
+        form.append("ownerAddress", walletAddress);
+
+        // Prepare: Encrypt off-chain + pin to IPFS + init envelope
         const { data: prepData } = await axios.post(`${API_BASE}/records/prepare`, form);
         const { recordId: newRecordId, cid, recordLabel: label } = prepData;
 
@@ -310,10 +461,14 @@ export default function App() {
         );
         showToast("Record registered via Server Signer!", "success");
       }
+      fetchRecords();
     } catch (err) {
-      const errMsg = err.reason || err.response?.data?.error || err.message;
-      addAuditLog("RECORD_REGISTERED", "Upload/Registration Failed", errMsg, null, "danger");
-      showToast(`Registration failed: ${errMsg}`, "error");
+      const parsed = parseMetaMaskError(err);
+      if (parsed.isNonce) {
+        setNonceModalError(parsed.message);
+      }
+      addAuditLog("RECORD_REGISTERED", "Upload/Registration Failed", parsed.message, null, "danger");
+      showToast(`${parsed.title}: ${parsed.message}`, "error");
     } finally {
       setIsUploading(false);
     }
@@ -323,6 +478,7 @@ export default function App() {
   const handleGrant = async () => {
     if (!recordId) return showToast("Record ID is required", "error");
     if (!granteeAddress) return showToast("Grantee Address is required", "error");
+    if (!isValidAddress(granteeAddress)) return showToast("Invalid Ethereum Grantee Address", "error");
 
     setIsActionLoading(true);
     try {
@@ -348,6 +504,13 @@ export default function App() {
         const tx = await contract.grantAccess(recordId, granteeAddress, expiresAt);
         const receipt = await tx.wait();
         txHash = receipt.hash || tx.hash;
+
+        // Synchronize per-grantee key wrapping in key manager
+        try {
+          await axios.post(`${API_BASE}/records/${recordId}/sync-grant`, { granteeAddress });
+        } catch (syncErr) {
+          console.warn("Key sync notice:", syncErr.message);
+        }
       } else {
         const { data } = await axios.post(`${API_BASE}/records/${recordId}/grant`, {
           granteeAddress,
@@ -365,10 +528,14 @@ export default function App() {
       );
       setAccessStatus({ checked: true, hasAccess: true, address: granteeAddress, note: expiryNote });
       showToast("Access granted successfully!", "success");
+      fetchRecords();
     } catch (err) {
-      const errMsg = err.reason || err.response?.data?.error || err.message;
-      addAuditLog("ACCESS_GRANTED", "Grant Failed", errMsg, null, "danger");
-      showToast(`Grant failed: ${errMsg}`, "error");
+      const parsed = parseMetaMaskError(err);
+      if (parsed.isNonce) {
+        setNonceModalError(parsed.message);
+      }
+      addAuditLog("ACCESS_GRANTED", "Grant Failed", parsed.message, null, "danger");
+      showToast(`${parsed.title}: ${parsed.message}`, "error");
     } finally {
       setIsActionLoading(false);
     }
@@ -378,6 +545,7 @@ export default function App() {
   const handleRevoke = async () => {
     if (!recordId) return showToast("Record ID is required", "error");
     if (!granteeAddress) return showToast("Grantee Address is required", "error");
+    if (!isValidAddress(granteeAddress)) return showToast("Invalid Ethereum Grantee Address", "error");
 
     setIsActionLoading(true);
     try {
@@ -392,6 +560,13 @@ export default function App() {
         const tx = await contract.revokeAccess(recordId, granteeAddress);
         const receipt = await tx.wait();
         txHash = receipt.hash || tx.hash;
+
+        // Synchronize key revocation in key manager
+        try {
+          await axios.post(`${API_BASE}/records/${recordId}/sync-revoke`, { granteeAddress });
+        } catch (syncErr) {
+          console.warn("Key sync notice:", syncErr.message);
+        }
       } else {
         const { data } = await axios.post(`${API_BASE}/records/${recordId}/revoke`, {
           granteeAddress,
@@ -408,10 +583,14 @@ export default function App() {
       );
       setAccessStatus({ checked: true, hasAccess: false, address: granteeAddress, note: "Revoked" });
       showToast("Access revoked immediately.", "warning");
+      fetchRecords();
     } catch (err) {
-      const errMsg = err.reason || err.response?.data?.error || err.message;
-      addAuditLog("ACCESS_REVOKED", "Revoke Failed", errMsg, null, "danger");
-      showToast(`Revoke failed: ${errMsg}`, "error");
+      const parsed = parseMetaMaskError(err);
+      if (parsed.isNonce) {
+        setNonceModalError(parsed.message);
+      }
+      addAuditLog("ACCESS_REVOKED", "Revoke Failed", parsed.message, null, "danger");
+      showToast(`${parsed.title}: ${parsed.message}`, "error");
     } finally {
       setIsActionLoading(false);
     }
@@ -622,7 +801,55 @@ export default function App() {
           </div>
 
           {/* Wallet & Status Controls */}
-          <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+            {/* How It Works Modal Trigger */}
+            <button
+              onClick={() => setShowHowItWorksModal(true)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 6,
+                padding: "8px 12px",
+                borderRadius: 8,
+                backgroundColor: "rgba(99, 102, 241, 0.12)",
+                border: "1px solid rgba(99, 102, 241, 0.25)",
+                color: "#a5b4fc",
+                fontSize: 12,
+                fontWeight: 600,
+                cursor: "pointer",
+              }}
+            >
+              <HelpCircle size={15} color="#818cf8" />
+              How It Works
+            </button>
+
+            {/* Network Switcher Dropdown */}
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <select
+                value={walletChainId === "0xaa36a7" ? "0xaa36a7" : "0x7a69"}
+                onChange={(e) => switchNetwork(e.target.value)}
+                style={{
+                  backgroundColor: "rgba(17, 24, 39, 0.8)",
+                  border:
+                    walletChainId &&
+                    walletChainId !== "0x7a69" &&
+                    walletChainId !== "0xaa36a7" &&
+                    walletChainId !== "0x539"
+                      ? "1px solid #f59e0b"
+                      : "1px solid var(--border-color)",
+                  color: walletChainId === "0xaa36a7" ? "#c084fc" : "#34d399",
+                  fontSize: 12,
+                  padding: "7px 10px",
+                  borderRadius: 8,
+                  cursor: "pointer",
+                  outline: "none",
+                }}
+              >
+                <option value="0x7a69">🟢 Hardhat (31337)</option>
+                <option value="0xaa36a7">🟣 Sepolia (11155111)</option>
+              </select>
+            </div>
+
             {/* MetaMask Wallet Connection Button */}
             {walletAddress ? (
               <div
@@ -678,33 +905,7 @@ export default function App() {
               </button>
             )}
 
-            {/* Network / Status Pills */}
-            <div
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 6,
-                padding: "6px 10px",
-                borderRadius: 8,
-                backgroundColor: "rgba(16, 185, 129, 0.1)",
-                border: "1px solid rgba(16, 185, 129, 0.2)",
-                fontSize: 12,
-                color: "#34d399",
-              }}
-            >
-              <span
-                style={{
-                  width: 8,
-                  height: 8,
-                  borderRadius: "50%",
-                  backgroundColor: "#10b981",
-                  display: "inline-block",
-                  boxShadow: "0 0 8px #10b981",
-                }}
-              />
-              Hardhat (8545)
-            </div>
-
+            {/* IPFS Node Status Pill */}
             <div
               style={{
                 display: "flex",
@@ -719,11 +920,57 @@ export default function App() {
               }}
             >
               <Database size={13} />
-              IPFS (5001)
+              IPFS Node
             </div>
           </div>
         </div>
       </header>
+
+      {/* MetaMask Missing Alert Banner */}
+      {!window.ethereum && !dismissMetaMaskWarning && (
+        <div
+          style={{
+            backgroundColor: "rgba(245, 158, 11, 0.12)",
+            borderBottom: "1px solid rgba(245, 158, 11, 0.3)",
+            padding: "10px 24px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            gap: 12,
+            fontSize: 13,
+            color: "#fbbf24",
+          }}
+        >
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <AlertTriangle size={18} />
+            <span>
+              <strong>MetaMask Not Detected:</strong> Please install the{" "}
+              <a
+                href="https://metamask.io/download/"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{ color: "#fef08a", textDecoration: "underline", fontWeight: 600 }}
+              >
+                MetaMask browser extension
+              </a>{" "}
+              to enable Web3 signing, or test using <strong>Server Signer Fallback</strong> below.
+            </span>
+          </div>
+          <button
+            onClick={() => setDismissMetaMaskWarning(true)}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#fbbf24",
+              cursor: "pointer",
+              fontSize: 18,
+              lineHeight: 1,
+            }}
+          >
+            &times;
+          </button>
+        </div>
+      )}
 
       {/* Contract Notification Bar */}
       {contractAddress && (
@@ -780,6 +1027,7 @@ export default function App() {
         >
           {[
             { id: "upload", label: "Upload & Encrypt", icon: Upload },
+            { id: "records", label: `My Records (${recordsList.length})`, icon: FolderOpen },
             { id: "access", label: "Access Control", icon: Key },
             { id: "decrypt", label: "Requester Portal & Decrypt", icon: Download },
             { id: "multiparty", label: "Multi-Party Demo Simulator", icon: Users },
@@ -1112,6 +1360,209 @@ export default function App() {
           </div>
         )}
 
+        {/* TAB: MY RECORDS */}
+        {activeTab === "records" && (
+          <div className="animate-fade-in" style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+            <div
+              style={{
+                backgroundColor: "var(--bg-card)",
+                border: "1px solid var(--border-color)",
+                borderRadius: 16,
+                padding: 24,
+              }}
+            >
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16, flexWrap: "wrap", gap: 12 }}>
+                <div>
+                  <h2 style={{ fontSize: 18, fontWeight: 700, display: "flex", alignItems: "center", gap: 8 }}>
+                    <FolderOpen size={20} color="#818cf8" /> Registered Encrypted Records
+                  </h2>
+                  <p style={{ fontSize: 13, color: "var(--text-secondary)", marginTop: 4 }}>
+                    View records secured in the decentralized framework. Each record is encrypted with AES-256-GCM and envelope-wrapped per grantee.
+                  </p>
+                </div>
+                <button
+                  onClick={fetchRecords}
+                  disabled={isLoadingRecords}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    padding: "8px 14px",
+                    borderRadius: 8,
+                    backgroundColor: "rgba(99, 102, 241, 0.15)",
+                    border: "1px solid rgba(99, 102, 241, 0.3)",
+                    color: "#818cf8",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  <RefreshCw size={14} className={isLoadingRecords ? "animate-spin" : ""} />
+                  {isLoadingRecords ? "Loading..." : "Refresh Records"}
+                </button>
+              </div>
+
+              {recordsList.length === 0 ? (
+                <div style={{ textAlign: "center", padding: "48px 16px", color: "var(--text-muted)" }}>
+                  <FolderOpen size={48} style={{ margin: "0 auto 12px", opacity: 0.4 }} />
+                  <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>No records found in storage</p>
+                  <p style={{ fontSize: 13, marginTop: 4 }}>Upload and encrypt your first confidential file in the Upload tab.</p>
+                  <button
+                    onClick={() => setActiveTab("upload")}
+                    style={{
+                      marginTop: 16,
+                      padding: "8px 16px",
+                      borderRadius: 8,
+                      backgroundColor: "#6366f1",
+                      border: "none",
+                      color: "#fff",
+                      fontWeight: 600,
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Go to Upload Tab
+                  </button>
+                </div>
+              ) : (
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 16 }}>
+                  {recordsList.map((rec, i) => (
+                    <div
+                      key={rec.recordId || i}
+                      style={{
+                        backgroundColor: "rgba(17, 24, 39, 0.6)",
+                        border: "1px solid var(--border-color)",
+                        borderRadius: 12,
+                        padding: 18,
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: 12,
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                        <div>
+                          <h4 style={{ fontSize: 15, fontWeight: 600, color: "var(--text-primary)" }}>
+                            {rec.recordLabel || rec.filename}
+                          </h4>
+                          <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                            File: {rec.filename} • {rec.mimeType}
+                          </span>
+                        </div>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            padding: "2px 8px",
+                            borderRadius: 9999,
+                            backgroundColor: "rgba(52, 211, 153, 0.15)",
+                            color: "#34d399",
+                            border: "1px solid rgba(52, 211, 153, 0.3)",
+                            fontWeight: 600,
+                          }}
+                        >
+                          {rec.authorizedCount || 1} Grantee{rec.authorizedCount === 1 ? "" : "s"}
+                        </span>
+                      </div>
+
+                      <div style={{ backgroundColor: "rgba(0,0,0,0.3)", padding: "8px 10px", borderRadius: 8, fontSize: 11 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+                          <span style={{ color: "var(--text-muted)" }}>Record ID:</span>
+                          <button
+                            onClick={() => copyToClipboard(rec.recordId, `rec-${i}`)}
+                            style={{ background: "none", border: "none", cursor: "pointer", color: copiedKey === `rec-${i}` ? "#34d399" : "#9ca3af" }}
+                          >
+                            {copiedKey === `rec-${i}` ? <Check size={12} /> : <Copy size={12} />}
+                          </button>
+                        </div>
+                        <code style={{ color: "#a5b4fc", display: "block", wordBreak: "break-all" }}>
+                          {rec.recordId}
+                        </code>
+                      </div>
+
+                      {rec.cid && (
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", fontSize: 11, color: "var(--text-secondary)" }}>
+                          <span>IPFS CID: <code>{rec.cid.substring(0, 10)}...{rec.cid.substring(rec.cid.length - 6)}</code></span>
+                          <a
+                            href={`https://ipfs.io/ipfs/${rec.cid}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: "#818cf8", display: "flex", alignItems: "center", gap: 3, textDecoration: "none" }}
+                          >
+                            Gateway <ExternalLink size={11} />
+                          </a>
+                        </div>
+                      )}
+
+                      {rec.ownerAddress && (
+                        <div style={{ fontSize: 11, color: "var(--text-muted)" }}>
+                          Owner: <code>{rec.ownerAddress.substring(0, 8)}...{rec.ownerAddress.substring(36)}</code>
+                        </div>
+                      )}
+
+                      <div style={{ display: "flex", gap: 8, marginTop: 4, paddingTop: 10, borderTop: "1px solid var(--border-color)" }}>
+                        <button
+                          onClick={() => {
+                            setRecordId(rec.recordId);
+                            setActiveTab("access");
+                          }}
+                          style={{
+                            flex: 1,
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            backgroundColor: "rgba(99, 102, 241, 0.15)",
+                            border: "1px solid rgba(99, 102, 241, 0.3)",
+                            color: "#818cf8",
+                            fontSize: 12,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Manage Access
+                        </button>
+                        <button
+                          onClick={() => {
+                            setDecryptRecordId(rec.recordId);
+                            setActiveTab("decrypt");
+                          }}
+                          style={{
+                            flex: 1,
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            backgroundColor: "rgba(6, 182, 212, 0.15)",
+                            border: "1px solid rgba(6, 182, 212, 0.3)",
+                            color: "#22d3ee",
+                            fontSize: 12,
+                            fontWeight: 600,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Decrypt
+                        </button>
+                        <button
+                          onClick={() => {
+                            setEventFilterRecordId(rec.recordId);
+                            setActiveTab("audit");
+                          }}
+                          style={{
+                            padding: "6px 10px",
+                            borderRadius: 6,
+                            backgroundColor: "rgba(255, 255, 255, 0.05)",
+                            border: "1px solid var(--border-color)",
+                            color: "var(--text-secondary)",
+                            fontSize: 12,
+                            cursor: "pointer",
+                          }}
+                        >
+                          Audit
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
         {/* TAB 2: ACCESS MANAGEMENT */}
         {activeTab === "access" && (
           <div className="animate-fade-in" style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(360px, 1fr))", gap: 24 }}>
@@ -1206,7 +1657,10 @@ export default function App() {
                     width: "100%",
                     padding: "10px 14px",
                     borderRadius: 8,
-                    border: "1px solid var(--border-color)",
+                    border:
+                      granteeAddress && !isValidAddress(granteeAddress)
+                        ? "1px solid #ef4444"
+                        : "1px solid var(--border-color)",
                     backgroundColor: "var(--bg-secondary)",
                     color: "var(--text-primary)",
                     fontFamily: "var(--font-mono)",
@@ -1214,6 +1668,19 @@ export default function App() {
                     outline: "none",
                   }}
                 />
+                {granteeAddress && (
+                  <div style={{ marginTop: 4 }}>
+                    {isValidAddress(granteeAddress) ? (
+                      <span style={{ fontSize: 11, color: "#34d399", display: "flex", alignItems: "center", gap: 4 }}>
+                        <Check size={12} /> Valid Ethereum Address
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: 11, color: "#f87171", display: "flex", alignItems: "center", gap: 4 }}>
+                        <AlertCircle size={12} /> Invalid Address format (0x followed by 40 hex chars)
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Expiration Policy */}
@@ -1501,7 +1968,10 @@ export default function App() {
                     width: "100%",
                     padding: "10px 14px",
                     borderRadius: 8,
-                    border: "1px solid var(--border-color)",
+                    border:
+                      requesterAddress && !isValidAddress(requesterAddress)
+                        ? "1px solid #ef4444"
+                        : "1px solid var(--border-color)",
                     backgroundColor: "var(--bg-secondary)",
                     color: "var(--text-primary)",
                     fontFamily: "var(--font-mono)",
@@ -1509,6 +1979,19 @@ export default function App() {
                     outline: "none",
                   }}
                 />
+                {requesterAddress && (
+                  <div style={{ marginTop: 4 }}>
+                    {isValidAddress(requesterAddress) ? (
+                      <span style={{ fontSize: 11, color: "#34d399", display: "flex", alignItems: "center", gap: 4 }}>
+                        <Check size={12} /> Valid Ethereum Address
+                      </span>
+                    ) : (
+                      <span style={{ fontSize: 11, color: "#f87171", display: "flex", alignItems: "center", gap: 4 }}>
+                        <AlertCircle size={12} /> Invalid Address format (0x followed by 40 hex chars)
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               {/* Record ID to fetch */}
@@ -1999,6 +2482,277 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* How It Works Modal */}
+      {showHowItWorksModal && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(0, 0, 0, 0.75)",
+            backdropFilter: "blur(6px)",
+            zIndex: 200,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setShowHowItWorksModal(false)}
+        >
+          <div
+            style={{
+              backgroundColor: "#111827",
+              border: "1px solid var(--border-color)",
+              borderRadius: 16,
+              maxWidth: 720,
+              width: "100%",
+              maxHeight: "90vh",
+              overflowY: "auto",
+              padding: 28,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div
+                  style={{
+                    padding: 8,
+                    borderRadius: 8,
+                    backgroundColor: "rgba(99, 102, 241, 0.15)",
+                    color: "#818cf8",
+                  }}
+                >
+                  <ShieldCheck size={22} />
+                </div>
+                <div>
+                  <h3 style={{ fontSize: 18, fontWeight: 700, color: "var(--text-primary)" }}>
+                    How SecureShare Works
+                  </h3>
+                  <p style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                    Zero-Knowledge Privacy, Dual-Layer Security & Tamper-Proof Audit
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowHowItWorksModal(false)}
+                style={{
+                  background: "none",
+                  border: "none",
+                  color: "var(--text-muted)",
+                  fontSize: 24,
+                  cursor: "pointer",
+                  lineHeight: 1,
+                }}
+              >
+                &times;
+              </button>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              {[
+                {
+                  step: "1",
+                  color: "#818cf8",
+                  title: "Off-Chain AES-256-GCM Encryption",
+                  desc: "Confidential files (PDF, health scans, banking records) are encrypted off-chain using fresh 256-bit symmetric Data Encryption Keys (DEK). Plaintext data never touches IPFS or the blockchain.",
+                },
+                {
+                  step: "2",
+                  color: "#06b6d4",
+                  title: "Decentralized IPFS Storage",
+                  desc: "Only the encrypted ciphertext blob is uploaded and pinned to IPFS, generating a content identifier (CID). Anyone who views the CID on IPFS sees only encrypted bytes.",
+                },
+                {
+                  step: "3",
+                  color: "#10b981",
+                  title: "Smart Contract Access Control",
+                  desc: "The data owner registers recordId and CID on Ethereum. The smart contract enforces who can view the record and records policy grants with optional time-based auto-expiry.",
+                },
+                {
+                  step: "4",
+                  color: "#f59e0b",
+                  title: "Per-Grantee Key Wrapping (Envelope Encryption)",
+                  desc: "The file's DEK is envelope-wrapped specifically per authorized grantee address using HKDF-SHA256 and AES-256-GCM. An unauthorized party cannot unwrap the DEK even if they obtain the ciphertext.",
+                },
+                {
+                  step: "5",
+                  color: "#ec4899",
+                  title: "Zero-Trust Retrieval & Immutable Audit Trail",
+                  desc: "When a requester queries the record, access is verified on-chain. An immutable AccessAttempted event is mined to the blockchain. If authorized, the requester's key is unwrapped and the file decrypted.",
+                },
+              ].map((item) => (
+                <div
+                  key={item.step}
+                  style={{
+                    display: "flex",
+                    gap: 14,
+                    padding: 14,
+                    borderRadius: 10,
+                    backgroundColor: "rgba(255, 255, 255, 0.03)",
+                    border: `1px solid ${item.color}33`,
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 28,
+                      height: 28,
+                      borderRadius: "50%",
+                      backgroundColor: `${item.color}22`,
+                      color: item.color,
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontWeight: 700,
+                      fontSize: 13,
+                      flexShrink: 0,
+                    }}
+                  >
+                    {item.step}
+                  </span>
+                  <div>
+                    <h4 style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)", marginBottom: 4 }}>
+                      {item.title}
+                    </h4>
+                    <p style={{ fontSize: 12, color: "var(--text-secondary)", lineHeight: 1.5 }}>
+                      {item.desc}
+                    </p>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ marginTop: 24, textAlign: "right" }}>
+              <button
+                onClick={() => setShowHowItWorksModal(false)}
+                style={{
+                  padding: "8px 18px",
+                  borderRadius: 8,
+                  backgroundColor: "#6366f1",
+                  border: "none",
+                  color: "#fff",
+                  fontWeight: 600,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                Got It, Let's Start
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MetaMask Nonce Desync Modal */}
+      {nonceModalError && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            backgroundColor: "rgba(0, 0, 0, 0.75)",
+            backdropFilter: "blur(6px)",
+            zIndex: 200,
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            padding: 16,
+          }}
+          onClick={() => setNonceModalError(null)}
+        >
+          <div
+            style={{
+              backgroundColor: "#111827",
+              border: "1px solid rgba(245, 158, 11, 0.4)",
+              borderRadius: 16,
+              maxWidth: 580,
+              width: "100%",
+              padding: 24,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.5)",
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+              <div
+                style={{
+                  padding: 10,
+                  borderRadius: 10,
+                  backgroundColor: "rgba(245, 158, 11, 0.15)",
+                  color: "#fbbf24",
+                }}
+              >
+                <AlertTriangle size={24} />
+              </div>
+              <div>
+                <h3 style={{ fontSize: 17, fontWeight: 700, color: "#fbbf24" }}>
+                  MetaMask Nonce Desynchronization
+                </h3>
+                <p style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+                  Local Hardhat blockchain was restarted, resetting transaction counters.
+                </p>
+              </div>
+            </div>
+
+            <div
+              style={{
+                backgroundColor: "rgba(0, 0, 0, 0.3)",
+                border: "1px solid var(--border-color)",
+                borderRadius: 8,
+                padding: 14,
+                fontSize: 13,
+                lineHeight: 1.6,
+                color: "var(--text-secondary)",
+                marginBottom: 18,
+              }}
+            >
+              <p style={{ fontWeight: 600, color: "var(--text-primary)", marginBottom: 8 }}>
+                How to fix in 5 seconds:
+              </p>
+              <ol style={{ paddingLeft: 20, margin: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                <li>Open your <strong>MetaMask browser extension</strong>.</li>
+                <li>Click the <strong>Account Icon</strong> or <strong>3 dots menu</strong> &rarr; <strong>Settings</strong>.</li>
+                <li>Select <strong>Advanced</strong>.</li>
+                <li>Click <strong>Clear activity tab data</strong> (or <em>Reset account</em>).</li>
+                <li>Retry your transaction!</li>
+              </ol>
+            </div>
+
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 12 }}>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, cursor: "pointer", color: "var(--text-muted)" }}>
+                <input
+                  type="checkbox"
+                  checked={useServerSignerFallback}
+                  onChange={(e) => {
+                    setUseServerSignerFallback(e.target.checked);
+                    setNonceModalError(null);
+                  }}
+                />
+                Switch to Server Signer (Bypass MetaMask)
+              </label>
+              <button
+                onClick={() => setNonceModalError(null)}
+                style={{
+                  padding: "8px 16px",
+                  borderRadius: 8,
+                  backgroundColor: "#f59e0b",
+                  border: "none",
+                  color: "#000",
+                  fontWeight: 700,
+                  fontSize: 13,
+                  cursor: "pointer",
+                }}
+              >
+                Done / Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Floating Toast Notification */}
       {toast && (
