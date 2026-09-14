@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+backend/node_modules/
+frontend/node_modules/
+
+# Build and runtime artifacts
+artifacts/
+cache/
+dist/
+frontend/dist/
+*.log
+.keyvault.json
+
+# Environment files and secrets
+.env
+.env.*
+backend/.env
+frontend/.env
+!.env.example
+!backend/.env.example
